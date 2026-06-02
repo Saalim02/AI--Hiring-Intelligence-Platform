@@ -1,33 +1,93 @@
-SKILLS_DB = [
-    "python",
-    "fastapi",
-    "sql",
-    "machine learning",
-    "deep learning",
-    "rag",
-    "docker",
-    "aws",
-    "langchain",
-    "postgresql",
-    "numpy",
-    "pandas",
-    "react",
-    "next.js",
-    "tailwind",
-    "faiss"
-]
+import json
+
+from app.core.openai_client import (
+    client
+)
 
 
-def extract_skills(text: str):
+def extract_skills(
+    text: str
+):
 
-    text = text.lower()
+    prompt = f"""
+    You are an ATS resume skill extraction system.
 
-    found_skills = []
+    Extract ONLY the skills explicitly mentioned
+    inside the SKILLS or TECHNICAL SKILLS section.
 
-    for skill in SKILLS_DB:
+    Ignore:
+    - project technologies
+    - certifications
+    - profile summary
+    - achievements
+    - experience section
 
-        if skill in text:
+    Return ONLY valid JSON.
 
-            found_skills.append(skill)
+    Example:
 
-    return list(set(found_skills))
+    {{
+        "skills": [
+            "Python",
+            "FastAPI",
+            "Docker"
+        ]
+    }}
+
+    Resume Skills Section:
+    {text}
+    """
+
+    response = client.chat.completions.create(
+
+        model="gpt-4.1-mini",
+
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+
+        temperature=0
+    )
+
+    content = response.choices[0].message.content.strip()
+
+    # Remove markdown formatting if present
+
+    content = content.replace(
+        "```json",
+        ""
+    )
+
+    content = content.replace(
+        "```",
+        ""
+    )
+
+    try:
+
+        parsed_json = json.loads(
+            content
+        )
+
+        return parsed_json.get(
+            "skills",
+            []
+        )
+
+    except Exception as e:
+
+        print(
+            "JSON Parsing Error:",
+            e
+        )
+
+        print(
+            "Raw OpenAI Response:",
+            content
+        )
+
+        return []
+
