@@ -1,30 +1,62 @@
-# Environment files
+# =========================
+# Environment / Secrets
+# =========================
 .env
-backend/.env
+*.env
+!.env.example
 
-# Uploads
-uploads/
-backend/uploads/
-
-# Python cache
+# =========================
+# Python
+# =========================
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
 
 # Virtual environments
 venv/
 env/
 .venv/
+ai_resume/
 
+# =========================
+# Runtime uploads
+# =========================
+uploads/
+
+# =========================
+# FAISS / Vector data
+# =========================
+vector_data/
+*.faiss
+resume_ids.npy
+
+# =========================
 # Jupyter
+# =========================
 .ipynb_checkpoints/
 
-# VS Code
+# =========================
+# IDE
+# =========================
 .vscode/
+.idea/
 
+# =========================
 # Logs
+# =========================
 logs/
 *.log
 
-# Frontend
+# =========================
+# Frontend / Node
+# =========================
 node_modules/
 .next/
+dist/
+build/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
