@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String
+from sqlalchemy.orm import relationship
 
 from app.core.database import Base
 
@@ -26,3 +27,8 @@ class User(Base):
     )
 
     hashed_password = Column(String)
+
+    role = Column(String(20), nullable=False, default="recruiter", server_default="recruiter")
+
+    resumes = relationship("Resume", back_populates="owner")
+    screening_sessions = relationship("ScreeningSession", back_populates="recruiter", cascade="all, delete-orphan")

@@ -1,6 +1,4 @@
-from app.core.openai_client import (
-    client
-)
+from app.core.openai_client import create_chat_completion
 
 
 def generate_ats_feedback(
@@ -39,7 +37,7 @@ def generate_ats_feedback(
     Keep response concise but professional.
     """
 
-    response = client.chat.completions.create(
+    response = create_chat_completion(
 
         model="gpt-4.1-mini",
 

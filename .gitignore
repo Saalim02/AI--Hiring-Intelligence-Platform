@@ -3,7 +3,9 @@
 # =========================
 .env
 *.env
+.env.*
 !.env.example
+!**/.env.example
 
 # =========================
 # Python
@@ -17,18 +19,39 @@ venv/
 env/
 .venv/
 ai_resume/
+ai_resume_backup_*/
+**/ai_resume_backup_*/
 
 # =========================
 # Runtime uploads
 # =========================
 uploads/
+**/uploads/
 
 # =========================
 # FAISS / Vector data
 # =========================
 vector_data/
+**/vector_data/
+vector_data
+**/vector_data
+vector_store/
+**/vector_store/
+vector_store
+**/vector_store
+model_cache/
+**/model_cache/
 *.faiss
 resume_ids.npy
+
+# Local database and runtime data
+*.sqlite
+*.sqlite3
+*.db
+backups/
+*.dump
+*.pem
+*.key
 
 # =========================
 # Jupyter

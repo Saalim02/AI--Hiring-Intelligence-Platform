@@ -3,12 +3,18 @@ uvicorn
 python-multipart
 sqlalchemy
 psycopg2-binary
+psycopg[binary]
 alembic
 pydantic[email]
+email-validator
 python-jose
 passlib[bcrypt]
 bcrypt==4.0.1
-sentence-transformers
+sentence-transformers==5.7.0
+transformers==4.57.3
+# CPU-only deployment target; avoids pulling the multi-GB CUDA runtime on EC2.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
 faiss-cpu
 langchain
 langsmith
@@ -16,3 +22,4 @@ openai
 pypdf
 pdfplumber
 python-dotenv
+pytest

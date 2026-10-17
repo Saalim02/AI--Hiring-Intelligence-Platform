@@ -7,16 +7,22 @@ from app.core.security import (
     verify_password
 )
 
+ALLOWED_ROLES = {"recruiter", "candidate"}
+
 
 def create_user(
     db: Session,
     username: str,
     email: str,
-    password: str
+    password: str,
+    role: str = "recruiter"
 ):
 
+    if role not in ALLOWED_ROLES:
+        raise ValueError("Invalid account role")
+
     existing_user = db.query(User).filter(
-        User.email == email
+        (User.email == email) | (User.username == username)
     ).first()
 
     if existing_user:
@@ -29,6 +35,7 @@ def create_user(
         username=username,
         email=email,
         hashed_password=hashed_pw
+        ,role=role
     )
 
     db.add(user)
@@ -53,10 +60,12 @@ def authenticate_user(
     if not user:
         return None
 
-    if not verify_password(
+    password_match = verify_password(
         password,
         user.hashed_password
-    ):
+    )
+
+    if not password_match:
         return None
 
     return user

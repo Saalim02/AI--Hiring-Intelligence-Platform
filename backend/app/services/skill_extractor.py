@@ -1,8 +1,7 @@
 import json
 
-from app.core.openai_client import (
-    client
-)
+from app.core.ai_errors import AIServiceInvalidResponse
+from app.core.openai_client import create_chat_completion
 
 
 def extract_skills(
@@ -38,7 +37,7 @@ def extract_skills(
     {text}
     """
 
-    response = client.chat.completions.create(
+    response = create_chat_completion(
 
         model="gpt-4.1-mini",
 
@@ -72,22 +71,11 @@ def extract_skills(
             content
         )
 
-        return parsed_json.get(
-            "skills",
-            []
-        )
+        skills = parsed_json.get("skills")
+        if not isinstance(skills, list):
+            raise ValueError("skills must be a list")
+        return [str(skill) for skill in skills]
 
-    except Exception as e:
-
-        print(
-            "JSON Parsing Error:",
-            e
-        )
-
-        print(
-            "Raw OpenAI Response:",
-            content
-        )
-
-        return []
+    except Exception:
+        raise AIServiceInvalidResponse("The AI service returned an invalid skill extraction result")
 

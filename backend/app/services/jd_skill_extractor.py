@@ -1,8 +1,7 @@
 import json
 
-from app.core.openai_client import (
-    client
-)
+from app.core.ai_errors import AIServiceInvalidResponse
+from app.core.openai_client import create_chat_completion
 
 
 def extract_jd_skills(
@@ -10,13 +9,13 @@ def extract_jd_skills(
 ):
 
     prompt = f"""
-   Extract ALL technical skills from this job description. 
-   IMPORTANT: 
-   - Return lowercase skills 
-   - Remove duplicates 
-   - Use concise canonical skill names 
-   - Normalize similar wording consistently 
-   
+   Extract ALL technical skills from this job description.
+   IMPORTANT:
+   - Return lowercase skills
+   - Remove duplicates
+   - Use concise canonical skill names
+   - Normalize similar wording consistently
+
    Use lowercase canonical skill names.
 
 Extract ONLY concrete technical skills:
@@ -49,13 +48,13 @@ backend optimization
 observability
 ai infrastructure scaling
 
-   Examples: 
-   - "Hugging Face Transformers" → "transformers"- "REST APIs" → "rest api" - "CI CD pipelines" → "ci/cd" - "Postgres" → "postgresql" Return ONLY valid JSON. 
-   
+   Examples:
+   - "Hugging Face Transformers" → "transformers"- "REST APIs" → "rest api" - "CI CD pipelines" → "ci/cd" - "Postgres" → "postgresql" Return ONLY valid JSON.
+
    Example: {{ "skills": [ "python", "fastapi", "docker", "kubernetes", "ci/cd" ] }} Job Description: {text}
     """
 
-    response = client.chat.completions.create(
+    response = create_chat_completion(
 
         model="gpt-4.1-mini",
 
@@ -89,21 +88,10 @@ ai infrastructure scaling
             content
         )
 
-        return parsed_json.get(
-            "skills",
-            []
-        )
+        skills = parsed_json.get("skills")
+        if not isinstance(skills, list):
+            raise ValueError("skills must be a list")
+        return [str(skill) for skill in skills]
 
-    except Exception as e:
-
-        print(
-            "JSON Parsing Error:",
-            e
-        )
-
-        print(
-            "Raw OpenAI Response:",
-            content
-        )
-
-        return []
+    except Exception:
+        raise AIServiceInvalidResponse("The AI service returned an invalid job skill extraction result")

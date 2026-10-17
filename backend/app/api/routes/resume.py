@@ -1,17 +1,25 @@
 import os
+import re
+import uuid
 
 from fastapi import (
     APIRouter,
     UploadFile,
     File,
-    Depends
+    Depends,
+    HTTPException,
+    Query
 )
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
+from app.core.dependencies import require_role
+from app.core.ai_errors import AIServiceError
 
 from app.models.resume import Resume
+from app.models.user import User
 
 from app.utils.logger import logger
 
@@ -62,10 +70,13 @@ from app.services.ats.candidate_ranker import (
 from app.services.ranking.explainable_ranker import (
     generate_ranking_report
 )
+from app.services.ats.evaluation import build_evaluation
+from app.services.candidate_email import extract_candidate_email
 
 router = APIRouter()
 
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = settings.UPLOAD_DIR
+MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_BYTES
 
 os.makedirs(
     UPLOAD_DIR,
@@ -79,10 +90,11 @@ os.makedirs(
 
 @router.get("/all")
 def get_all_resumes(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role("recruiter"))
 ):
 
-    resumes = db.query(Resume).all()
+    resumes = db.query(Resume).filter(Resume.owner_id == user.id).all()
 
     return resumes
 
@@ -93,17 +105,16 @@ def get_all_resumes(
 
 @router.get("/search/")
 def search_resumes(
-    query: str,
-    db: Session = Depends(get_db)
+    query: str = Query(..., min_length=2, max_length=500),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role("recruiter"))
 ):
 
     matched_resume_ids = semantic_resume_search(
         query
     )
 
-    resumes = db.query(Resume).filter(
-        Resume.id.in_(matched_resume_ids)
-    ).all()
+    resumes = db.query(Resume).filter(Resume.owner_id == user.id, Resume.id.in_(matched_resume_ids)).all()
 
     results = []
 
@@ -134,20 +145,15 @@ def search_resumes(
 def get_resume_by_id(
 
     resume_id: int,
-
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role("recruiter", "candidate"))
 
 ):
 
-    resume = db.query(Resume).filter(
-        Resume.id == resume_id
-    ).first()
+    resume = db.query(Resume).filter(Resume.id == resume_id, Resume.owner_id == user.id).first()
 
     if not resume:
-
-        return {
-            "message": "Resume not found"
-        }
+        raise HTTPException(status_code=404, detail="Resume not found")
 
     return resume
 
@@ -160,63 +166,61 @@ def get_resume_by_id(
 async def upload_resume(
 
     file: UploadFile = File(...),
-
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role("recruiter", "candidate"))
 
 ):
 
-    logger.info(
-        f"Uploading file: {file.filename}"
-    )
+    original_filename = file.filename or "resume.pdf"
+    logger.info("Uploading resume PDF")
 
-    if not file.filename.endswith(".pdf"):
+    if file.content_type != "application/pdf" or not original_filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=415, detail="Only PDF files are allowed")
 
-        return {
-            "message": "Only PDF files are allowed"
-        }
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.splitext(original_filename)[0])[:120] or "resume"
+    stored_filename = f"{safe_stem}-{uuid.uuid4().hex[:12]}.pdf"
 
     file_path = os.path.join(
         UPLOAD_DIR,
-        file.filename
+        stored_filename
     )
 
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Resume exceeds the 10 MB upload limit")
+    if not content.startswith(b"%PDF"):
+        raise HTTPException(status_code=415, detail="The uploaded file is not a valid PDF")
     with open(file_path, "wb") as buffer:
+        buffer.write(content)
 
-        buffer.write(
-            await file.read()
-        )
+    try:
+        extracted_text = extract_text_from_pdf(file_path)
 
-    extracted_text = extract_text_from_pdf(
-        file_path
-    )
+        # Extract ONLY skills section
+        skills_section = extract_skills_section(extracted_text)
 
-    # Extract ONLY skills section
+        # AI Resume Skill Extraction
+        skills = extract_skills(skills_section)
 
-    skills_section = extract_skills_section(
-        extracted_text
-    )
+        # Semantic embeddings
+        embedding = generate_embedding(extracted_text)
+    except AIServiceError:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        raise
 
-    # AI Resume Skill Extraction
-
-    skills = extract_skills(
-        skills_section
-    )
-    
-    print("RESUME SKILLS:", skills)
-
-    # Semantic embeddings
-
-    embedding = generate_embedding(
-        extracted_text
-    )
-
+    email_details = extract_candidate_email(extracted_text)
     resume = Resume(
 
-        filename=file.filename,
+        filename=original_filename,
 
         extracted_text=extracted_text,
-
-        skills=", ".join(skills)
+        skills=", ".join(skills),
+        candidate_name=email_details.candidate_name,
+        extracted_email=email_details.email,
+        owner_id=user.id
     )
 
     db.add(resume)
@@ -251,21 +255,16 @@ def ats_score(
 
     resume_id: int,
 
-    job_description: str,
-
-    db: Session = Depends(get_db)
+    job_description: str = Query(..., min_length=10, max_length=20000),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role("recruiter"))
 
 ):
 
-    resume = db.query(Resume).filter(
-        Resume.id == resume_id
-    ).first()
+    resume = db.query(Resume).filter(Resume.id == resume_id, Resume.owner_id == user.id).first()
 
     if not resume:
-
-        return {
-            "message": "Resume not found"
-        }
+        raise HTTPException(status_code=404, detail="Resume not found")
 
     # Semantic ATS score
 
@@ -281,46 +280,7 @@ def ats_score(
     jd_skills = extract_jd_skills(
         job_description
     )
-    print("JD SKILLS:", jd_skills)
-    
-
-    # Resume stored skills
-
-    resume_skills = [
-
-        skill.strip()
-
-        for skill in resume.skills.split(",")
-    ]
-
-    # Skill gap analysis
-
-    matched_skills, missing_skills = analyze_skill_gap(
-
-        resume_skills,
-
-        jd_skills
-    )
-
-    # Basic recommendation
-
-    if score >= 80:
-
-        recommendation = (
-            "Strong candidate match"
-        )
-
-    elif score >= 60:
-
-        recommendation = (
-            "Moderate candidate match"
-        )
-
-    else:
-
-        recommendation = (
-            "Low candidate match"
-        )
+    evaluation = build_evaluation(resume=resume, score=score, job_skills=jd_skills)
 
     # AI recruiter feedback
 
@@ -328,20 +288,14 @@ def ats_score(
 
         ats_score=score,
 
-        matched_skills=matched_skills,
+        matched_skills=evaluation["skills"]["matched_preferred"],
 
-        missing_skills=missing_skills,
+        missing_skills=evaluation["skills"]["missing_preferred"],
 
         job_description=job_description
     )
-    
-    ranking_report = generate_ranking_report(
-    score,
-    matched_skills,
-    missing_skills
-    )
-    
-    return {
+
+    return {**evaluation, "resume_id": resume.id,
 
     "resume_id":
     resume.id,
@@ -352,32 +306,23 @@ def ats_score(
     "overall_score":
     score,
 
-    "matched_skills":
-    matched_skills,
+    "matched_skills": evaluation["skills"]["matched_preferred"],
 
-    "missing_skills":
-    missing_skills,
+    "missing_skills": evaluation["skills"]["missing_preferred"],
 
-    "recommendation":
-    recommendation,
+    "recommendation": evaluation["recommendation"]["label"],
 
     "ai_feedback":
     feedback,
 
     "score_breakdown":
-    ranking_report[
-        "score_breakdown"
-    ],
+    evaluation["score_breakdown"],
 
     "strengths":
-    ranking_report[
-        "strengths"
-    ],
+    evaluation["strengths"],
 
     "improvements":
-    ranking_report[
-        "improvements"
-    ]
+    evaluation["recommendations"]
 }
 # =========================
 # CANDIDATE RANKING
@@ -386,21 +331,16 @@ def ats_score(
 @router.post("/rank-candidates")
 def rank_all_candidates(
 
-    job_description: str,
-
-    db: Session = Depends(get_db)
+    job_description: str = Query(..., min_length=10, max_length=20000),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role("recruiter"))
 
 ):
 
-    resumes = db.query(
-        Resume
-    ).all()
+    resumes = db.query(Resume).filter(Resume.owner_id == user.id).all()
 
     if not resumes:
-
-        return {
-            "message": "No resumes found"
-        }
+        raise HTTPException(status_code=404, detail="No resumes found")
 
     rankings = rank_candidates(
 

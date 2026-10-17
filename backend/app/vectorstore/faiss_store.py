@@ -3,14 +3,13 @@ import os
 import faiss
 import numpy as np
 
+from app.core.config import settings
+
 
 # BAAI/bge-large-en-v1.5 = 1024 dimensions
 dimension = 1024
 
-VECTOR_DIR = os.getenv(
-    "VECTOR_DATA_DIR",
-    "vector_data"
-)
+VECTOR_DIR = settings.VECTOR_DATA_DIR
 
 INDEX_PATH = os.path.join(
     VECTOR_DIR,
@@ -56,17 +55,7 @@ def load_vectorstore():
                 "are inconsistent"
             )
 
-        print(
-            f"Loaded {loaded_index.ntotal} "
-            "vectors from persistent FAISS store"
-        )
-
         return loaded_index, loaded_ids
-
-    print(
-        "No persistent FAISS store found. "
-        "Creating empty index."
-    )
 
     return (
         faiss.IndexFlatL2(dimension),
@@ -98,11 +87,6 @@ def add_embedding(
     resume_id
 ):
 
-    print("=" * 50)
-    print("ADD EMBEDDING CALLED")
-    print("Resume ID:", resume_id)
-    print("Embedding Length:", len(embedding))
-
     vector = np.array(
         [embedding],
         dtype="float32"
@@ -116,36 +100,13 @@ def add_embedding(
 
     save_vectorstore()
 
-    print(
-        "Current Resume IDs:",
-        resume_ids
-    )
-
-    print(
-        "FAISS store persisted to disk"
-    )
-
-    print("=" * 50)
-
 
 def search_embedding(
     query_embedding,
     top_k=5
 ):
 
-    print("=" * 50)
-    print("SEARCH CALLED")
-    print("Resume IDs:", resume_ids)
-
-    print(
-        "Query Embedding Length:",
-        len(query_embedding)
-    )
-
     if len(resume_ids) == 0:
-
-        print("NO RESUMES FOUND")
-
         return []
 
     actual_top_k = min(
@@ -163,9 +124,6 @@ def search_embedding(
         actual_top_k
     )
 
-    print("Distances:", distances)
-    print("Indices:", indices)
-
     results = []
 
     for idx in indices[0]:
@@ -178,12 +136,5 @@ def search_embedding(
             results.append(
                 resume_ids[idx]
             )
-
-    print(
-        "FINAL RESULTS:",
-        results
-    )
-
-    print("=" * 50)
 
     return results

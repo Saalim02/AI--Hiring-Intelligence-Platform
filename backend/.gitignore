@@ -30,3 +30,12 @@ node_modules/
 .next/
 # Project virtual environment
 ai_resume/
+ai_resume_backup_*/
+uploads/
+vector_data/
+vector_store/
+*.faiss
+resume_ids.npy
+*.sqlite
+*.sqlite3
+*.db

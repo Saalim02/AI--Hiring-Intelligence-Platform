@@ -1,4 +1,6 @@
 ai_resume/
+ai_resume_backup_*/
+**/ai_resume_backup_*/
 venv/
 .venv/
 
@@ -20,6 +22,18 @@ notebooks/
 .ipynb_checkpoints/
 
 uploads/
+vector_data/
+vector_store/
+model_cache/
+backups/
+*.dump
+*.pem
+*.key
+*.faiss
+resume_ids.npy
+*.sqlite
+*.sqlite3
+*.db
 
 logs/
 *.log

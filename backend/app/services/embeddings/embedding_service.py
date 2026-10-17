@@ -1,13 +1,26 @@
-from sentence_transformers import (
-    SentenceTransformer
-)
+from sentence_transformers import SentenceTransformer
 
 from langsmith import traceable
+from app.core.ai_errors import AIServiceUnavailable
 
 
-model = SentenceTransformer(
-    "BAAI/bge-large-en-v1.5"
-)
+MODEL_NAME = "BAAI/bge-large-en-v1.5"
+model = None
+
+
+def _get_model():
+    """Load the embedding model only when an embedding operation is requested."""
+    global model
+    if model is not None:
+        return model
+
+    try:
+        model = SentenceTransformer(MODEL_NAME)
+    except Exception as exc:
+        raise AIServiceUnavailable(
+            "AI processing is temporarily unavailable. Please try again later."
+        ) from exc
+    return model
 
 
 @traceable(
@@ -16,8 +29,7 @@ model = SentenceTransformer(
 def generate_embedding(
     text: str
 ):
-
-    embedding = model.encode(
+    embedding = _get_model().encode(
         text
     )
 

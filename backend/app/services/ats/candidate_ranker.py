@@ -9,6 +9,7 @@ from app.services.jd_skill_extractor import (
 from app.services.ats.skill_gap import (
     analyze_skill_gap
 )
+from app.services.ats.evaluation import build_evaluation
 
 
 def rank_candidates(
@@ -36,12 +37,7 @@ def rank_candidates(
             for skill in resume.skills.split(",")
         ]
 
-        matched_skills, missing_skills = (
-            analyze_skill_gap(
-                resume_skills,
-                jd_skills
-            )
-        )
+        evaluation = build_evaluation(resume=resume, score=score, job_skills=jd_skills)
 
         rankings.append({
 
@@ -54,14 +50,12 @@ def rank_candidates(
             "ats_score":
             score,
 
-            "matched_skills":
-            matched_skills,
-
-            "missing_skills":
-            missing_skills,
+            "matched_skills": evaluation["skills"]["matched_preferred"],
+            "missing_skills": evaluation["skills"]["missing_preferred"],
+            "evaluation": evaluation,
 
             "total_matched_skills":
-            len(matched_skills)
+            len(evaluation["skills"]["matched_preferred"])
         })
 
     rankings.sort(
