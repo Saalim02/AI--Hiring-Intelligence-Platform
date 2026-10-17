@@ -1,3 +1,4 @@
+
 name: Deploy to EC2 (manual)
 
 on:
@@ -8,10 +9,15 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 30
     concurrency:
       group: production-deploy
       cancel-in-progress: false
@@ -22,12 +28,12 @@ jobs:
         env:
           RELEASE_SHA: ${{ inputs.commit_sha }}
         run: |
-          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "commit_sha must be exactly 40 hexadecimal characters" >&2
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Enter the full 40-character lowercase commit SHA." >&2
             exit 1
           fi
 
-      - name: Check out the exact release revision
+      - name: Check out exact release
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit_sha }}
@@ -38,61 +44,42 @@ jobs:
         env:
           RELEASE_SHA: ${{ inputs.commit_sha }}
         run: |
-          actual_sha="$(git rev-parse HEAD)"
-          if [[ "$actual_sha" != "$RELEASE_SHA" ]]; then
-            echo "Checked-out revision $actual_sha does not match requested release $RELEASE_SHA" >&2
-            exit 1
-          fi
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
-      - name: Configure strict SSH verification
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+          role-session-name: HirewiseProductionDeploy
+
+      - name: Verify AWS identity and SSM instance
+        shell: bash
         run: |
-          test -n "$EC2_HOST"
-          test -n "$EC2_USER"
-          test -n "$EC2_SSH_KEY"
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-          test -s ~/.ssh/known_hosts
+          aws sts get-caller-identity
+          aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=i-0f66d30dc1d60be50" \
+            --query 'InstanceInformationList[0].PingStatus' \
+            --output text | grep -x Online
 
-      - name: Deploy exact revision without replacing env files or volumes
+      - name: Prepare protected deployment script
+        shell: bash
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
           RELEASE_SHA: ${{ inputs.commit_sha }}
         run: |
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i ~/.ssh/deploy_key \
-            "$EC2_USER@$EC2_HOST" bash -s -- "$RELEASE_SHA" <<'REMOTE'
-          set -euo pipefail
+          cat > "$RUNNER_TEMP/hirewise-deploy.sh" <<'REMOTE'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
 
           release_sha="$1"
-          checkout_dir=/home/ubuntu/hirewise
-          expected_revision=20261015_02
+          expected_revision="20261015_02"
+          checkout_dir="/home/ubuntu/hirewise"
+
           cd "$checkout_dir"
 
-          if [[ ! "$release_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "Invalid release SHA received by deployment host" >&2
-            exit 1
-          fi
-
-          for required_file in .env.prod backend/.env.prod; do
-            if [[ ! -f "$required_file" ]]; then
-              echo "Required production file is missing: $checkout_dir/$required_file" >&2
-              exit 1
-            fi
-          done
-
-          for env_file in .env.prod backend/.env.prod; do
-            if [[ "$(stat -c '%a' "$env_file")" != "600" ]]; then
-              echo "Production environment file must have mode 600: $checkout_dir/$env_file" >&2
-              exit 1
-            fi
+          for f in .env.prod backend/.env.prod; do
+            test -f "$f"
+            test "$(stat -c '%a' "$f")" = "600"
           done
 
           root_env_before="$(sha256sum .env.prod)"
@@ -101,224 +88,227 @@ jobs:
           git fetch --prune origin "$release_sha"
           git cat-file -e "$release_sha^{commit}"
 
-          for env_file in .env.prod backend/.env.prod; do
-            if git ls-files --error-unmatch "$env_file" >/dev/null 2>&1; then
-              echo "Production environment file is tracked by the checkout: $env_file" >&2
+          for f in .env.prod backend/.env.prod; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "Refusing: production environment file is tracked: $f" >&2
               exit 1
             fi
-            if git cat-file -e "$release_sha:$env_file" >/dev/null 2>&1; then
-              echo "Target release contains a production environment file: $env_file" >&2
+            if git cat-file -e "$release_sha:$f" 2>/dev/null; then
+              echo "Refusing: release contains production environment file: $f" >&2
               exit 1
             fi
           done
 
-          # These files may have been installed manually before this release
-          # started tracking them. Permit only an exact match to the target
-          # release; never overwrite an unknown local file.
-          for deployment_file in docker-compose.prod.yml deploy/nginx.conf; do
-            if [[ -e "$deployment_file" && ! -f "$deployment_file" ]]; then
-              echo "Expected deployment file is not a regular file: $deployment_file" >&2
-              exit 1
-            fi
-            if [[ -f "$deployment_file" ]]; then
-              target_blob="$(git rev-parse "$release_sha:$deployment_file" 2>/dev/null)" || {
-                echo "Target release does not contain required deployment file: $deployment_file" >&2
-                exit 1
-              }
-              local_blob="$(git hash-object "$deployment_file")"
-              if [[ "$local_blob" != "$target_blob" ]]; then
-                echo "Existing deployment file differs from the target release: $deployment_file" >&2
-                exit 1
-              fi
-            else
-              git cat-file -e "$release_sha:$deployment_file" 2>/dev/null || {
-                echo "Target release does not contain required deployment file: $deployment_file" >&2
+          for f in docker-compose.prod.yml deploy/nginx.conf; do
+            target_blob="$(git rev-parse "$release_sha:$f")"
+            if [[ -f "$f" ]]; then
+              [[ "$(git hash-object "$f")" = "$target_blob" ]] || {
+                echo "Deployment file differs from release: $f" >&2
                 exit 1
               }
             fi
           done
 
           if ! git diff --quiet || ! git diff --cached --quiet; then
-            echo "Tracked changes exist in the production checkout; refusing deployment" >&2
+            echo "Refusing deployment: tracked local changes exist." >&2
             exit 1
           fi
 
           git checkout --detach "$release_sha"
 
-          # The environment files are ignored and are intentionally not copied,
-          # regenerated, checked out, or otherwise replaced by this workflow.
-          for required_file in .env.prod backend/.env.prod docker-compose.prod.yml deploy/nginx.conf; do
-            test -f "$required_file"
+          [[ "$(sha256sum .env.prod)" == "$root_env_before" ]]
+          [[ "$(sha256sum backend/.env.prod)" == "$backend_env_before" ]]
+
+          for f in .env.prod backend/.env.prod docker-compose.prod.yml deploy/nginx.conf; do
+            test -f "$f"
           done
-          [[ "$(sha256sum .env.prod)" == "$root_env_before" ]] || {
-            echo "Checkout changed .env.prod; refusing deployment" >&2
-            exit 1
-          }
-          [[ "$(sha256sum backend/.env.prod)" == "$backend_env_before" ]] || {
-            echo "Checkout changed backend/.env.prod; refusing deployment" >&2
-            exit 1
-          }
 
           dc() {
             docker compose --env-file .env.prod -f docker-compose.prod.yml "$@"
           }
 
-          if ! docker info >/dev/null 2>&1; then
-            echo "The deployment user cannot access Docker. Resolve Docker socket permissions before retrying." >&2
-            exit 1
-          fi
-
+          docker info >/dev/null
           dc config --quiet
 
-          # Initial restoration is a separate, manual procedure. Require an
-          # existing PostgreSQL container so this workflow cannot bootstrap an
-          # empty database or create a new database volume accidentally.
-          existing_postgres_container="$(dc ps -aq postgres)"
-          if [[ -z "$existing_postgres_container" ]]; then
-            echo "No existing PostgreSQL container found; complete the manual backup restore before routine deployment" >&2
-            exit 1
-          fi
-          if [[ "$(wc -l <<<"$existing_postgres_container")" != "1" ]]; then
-            echo "Unexpected number of PostgreSQL containers found; refusing deployment" >&2
-            exit 1
-          fi
+          # Never bootstrap an empty database or substitute a new volume.
+          postgres_id="$(dc ps -aq postgres)"
+          [[ -n "$postgres_id" ]]
+          [[ "$(wc -l <<< "$postgres_id")" = "1" ]]
 
-          postgres_project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$existing_postgres_container")"
-          if [[ -z "$postgres_project" ]]; then
-            echo "Could not determine the Compose project for the existing PostgreSQL container; refusing deployment" >&2
-            exit 1
-          fi
-          configured_postgres_volume="$(dc config --format json | python3 -c \
-            'import json, sys; print(json.load(sys.stdin).get("volumes", {}).get("postgres_data", {}).get("name", ""))')"
-          if [[ -n "$configured_postgres_volume" ]]; then
-            expected_postgres_volume="$configured_postgres_volume"
-          else
-            mapfile -t resolved_postgres_volumes < <(docker volume ls -q \
-              --filter "label=com.docker.compose.project=$postgres_project" \
-              --filter "label=com.docker.compose.volume=postgres_data")
-            if [[ "${#resolved_postgres_volumes[@]}" != "1" ]]; then
-              echo "Could not resolve exactly one Docker volume for Compose postgres_data; refusing deployment" >&2
-              exit 1
-            fi
-            expected_postgres_volume="${resolved_postgres_volumes[0]}"
-          fi
-          if [[ -z "$expected_postgres_volume" ]] || ! docker volume inspect "$expected_postgres_volume" >/dev/null 2>&1; then
-            echo "Expected PostgreSQL volume is missing; complete the manual backup restore before routine deployment" >&2
-            exit 1
-          fi
-          actual_postgres_volume="$(docker inspect -f \
-            '{{range .Mounts}}{{if eq .Destination \"/var/lib/postgresql/data\"}}{{.Name}}{{end}}{{end}}' \
-            "$existing_postgres_container")"
-          if [[ "$actual_postgres_volume" != "$expected_postgres_volume" ]]; then
-            echo "PostgreSQL container is attached to an unexpected volume; refusing deployment" >&2
-            exit 1
-          fi
+          configured_volume="$(dc config --format json | python3 -c \
+            'import json,sys; print(json.load(sys.stdin)["volumes"]["postgres_data"].get("name",""))')"
 
-          # This starts only the existing PostgreSQL service. It never restores,
-          # drops, recreates, or deletes the database or persistent volumes.
+          actual_volume="$(docker inspect -f \
+            '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' \
+            "$postgres_id")"
+
+          [[ -n "$configured_volume" ]]
+          [[ -n "$actual_volume" ]]
+          [[ "$actual_volume" = "$configured_volume" ]]
+          docker volume inspect "$actual_volume" >/dev/null
+
           dc up -d postgres
+
+          ready=false
           for attempt in {1..30}; do
-            if dc ps --status running postgres | grep -q postgres; then
-              if dc exec -T postgres pg_isready >/dev/null 2>&1; then
-                break
-              fi
-            fi
-            if [[ "$attempt" == 30 ]]; then
-              echo "PostgreSQL did not become ready" >&2
-              dc logs --tail=100 postgres >&2 || true
-              exit 1
-            fi
-            sleep 5
-          done
-
-          table_state="$(dc exec -T postgres sh -c \
-            'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -F "|" -Atqc "SELECT (to_regclass(\$\$public.users\$\$) IS NOT NULL)::int, (to_regclass(\$\$public.resumes\$\$) IS NOT NULL)::int, (to_regclass(\$\$public.alembic_version\$\$) IS NOT NULL)::int"')"
-          IFS='|' read -r users_table resumes_table version_table <<< "$table_state"
-
-          if [[ "$users_table" != "1" || "$resumes_table" != "1" || "$version_table" != "1" ]]; then
-            echo "Essential production tables are missing; refusing migration/deployment" >&2
-            exit 1
-          fi
-
-          revision_state="$(dc exec -T postgres sh -c \
-            'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -F "|" -Atqc "SELECT count(*), coalesce((SELECT version_num FROM alembic_version LIMIT 1)::text, \$\$UNSET\$\$)"')"
-          IFS='|' read -r revision_count database_revision <<< "$revision_state"
-          if [[ "$revision_count" != "1" || "$database_revision" != "$expected_revision" ]]; then
-            echo "Expected restored Alembic revision $expected_revision was not found; refusing migration/deployment" >&2
-            exit 1
-          fi
-
-          # Validate the source revision after the database check and before
-          # building application images, avoiding unnecessary work on an
-          # empty/unrestored database.
-          dc build
-
-          current_state="$(dc run --rm --no-deps backend alembic current 2>&1)" || {
-            echo "Alembic could not read the restored production revision" >&2
-            echo "$current_state" >&2
-            exit 1
-          }
-          if grep -Eq 'No such revision|None$|FAILED|ERROR' <<<"$current_state"; then
-            echo "Restored Alembic revision is invalid for this release" >&2
-            echo "$current_state" >&2
-            exit 1
-          fi
-          if ! grep -Fq "$expected_revision" <<<"$current_state"; then
-            echo "Database Alembic revision does not match the revision reported by this release" >&2
-            exit 1
-          fi
-
-          heads_state="$(dc run --rm --no-deps backend alembic heads 2>&1)" || {
-            echo "Alembic could not determine the migration head for this release" >&2
-            echo "$heads_state" >&2
-            exit 1
-          }
-          if grep -Eq 'No such revision|FAILED|ERROR' <<<"$heads_state" || [[ -z "$heads_state" ]]; then
-            echo "This release has an invalid Alembic migration chain" >&2
-            echo "$heads_state" >&2
-            exit 1
-          fi
-
-          # Migrations are permitted only after the non-empty database and its
-          # valid Alembic state have been verified. No restore is performed here.
-          dc run --rm --no-deps backend alembic upgrade head
-
-          dc up -d
-
-          for attempt in {1..36}; do
-            all_services_healthy=true
-            for service in postgres backend frontend; do
-              service_id="$(dc ps -q "$service")"
-              service_state=""
-              service_health=""
-              [[ -n "$service_id" ]] && service_state="$(docker inspect -f '{{.State.Status}}' "$service_id" 2>/dev/null || true)"
-              [[ -n "$service_id" ]] && service_health="$(docker inspect -f '{{.State.Health.Status}}' "$service_id" 2>/dev/null || true)"
-              if [[ "$service_state" != "running" || "$service_health" != "healthy" ]]; then
-                all_services_healthy=false
-              fi
-            done
-            nginx_id="$(dc ps -q nginx)"
-            nginx_state=""
-            [[ -n "$nginx_id" ]] && nginx_state="$(docker inspect -f '{{.State.Status}}' "$nginx_id" 2>/dev/null || true)"
-            if [[ "$nginx_state" != "running" ]]; then
-              all_services_healthy=false
-            fi
-            if [[ "$all_services_healthy" == true ]] && \
-              curl --fail --silent --show-error http://127.0.0.1/api/health >/dev/null && \
-              curl --fail --silent --show-error http://127.0.0.1/ >/dev/null; then
+            if dc exec -T postgres pg_isready >/dev/null 2>&1; then
+              ready=true
               break
             fi
-            if [[ "$attempt" == 36 ]]; then
-              echo "Production service or HTTP health checks failed" >&2
-              dc ps >&2 || true
-              dc logs --tail=150 backend frontend nginx >&2 || true
-              exit 1
+            sleep 5
+          done
+          [[ "$ready" = true ]] || {
+            dc logs --tail=100 postgres >&2 || true
+            exit 1
+          }
+
+          table_state="$(dc exec -T postgres sh -c \
+            'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -F "|" -Atqc "SELECT (to_regclass('\''public.users'\'') IS NOT NULL)::int, (to_regclass('\''public.resumes'\'') IS NOT NULL)::int, (to_regclass('\''public.alembic_version'\'') IS NOT NULL)::int"')"
+
+          [[ "$table_state" = "1|1|1" ]] || {
+            echo "Essential database tables missing; refusing deployment." >&2
+            exit 1
+          }
+
+          revision_state="$(dc exec -T postgres sh -c \
+            'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -F "|" -Atqc "SELECT count(*), coalesce((SELECT version_num FROM alembic_version LIMIT 1)::text, '\''UNSET'\'')"')"
+
+          [[ "$revision_state" = "1|$expected_revision" ]] || {
+            echo "Unexpected database revision; refusing deployment." >&2
+            exit 1
+          }
+
+          dc build
+
+          current_state="$(dc run --rm --no-deps backend alembic current)"
+          grep -Fq "$expected_revision" <<< "$current_state"
+
+          heads_state="$(dc run --rm --no-deps backend alembic heads)"
+          [[ -n "$heads_state" ]]
+
+          dc run --rm --no-deps backend alembic upgrade head
+          dc up -d
+
+          healthy=false
+          for attempt in {1..36}; do
+            all_healthy=true
+
+            for service in postgres backend frontend; do
+              service_id="$(dc ps -q "$service")"
+              if [[ -z "$service_id" ]] ||
+                 [[ "$(docker inspect -f '{{.State.Status}}' "$service_id")" != "running" ]] ||
+                 [[ "$(docker inspect -f '{{.State.Health.Status}}' "$service_id" 2>/dev/null || true)" != "healthy" ]]; then
+                all_healthy=false
+              fi
+            done
+
+            nginx_id="$(dc ps -q nginx)"
+            if [[ -z "$nginx_id" ]] ||
+               [[ "$(docker inspect -f '{{.State.Status}}' "$nginx_id" 2>/dev/null || true)" != "running" ]]; then
+              all_healthy=false
+            fi
+
+            if [[ "$all_healthy" = true ]] &&
+               curl --fail --silent http://127.0.0.1/api/health >/dev/null &&
+               curl --fail --silent http://127.0.0.1/ >/dev/null; then
+              healthy=true
+              break
             fi
             sleep 5
           done
+
+          if [[ "$healthy" != true ]]; then
+            dc ps >&2 || true
+            dc logs --tail=150 backend frontend nginx >&2 || true
+            exit 1
+          fi
 
           dc ps
           REMOTE
+
+          chmod 600 "$RUNNER_TEMP/hirewise-deploy.sh"
+
+          # Split the script into short chunks so each SSM command stays small.
+          base64 -w 0 "$RUNNER_TEMP/hirewise-deploy.sh" > "$RUNNER_TEMP/hirewise-deploy.b64"
+          split -b 2500 -d "$RUNNER_TEMP/hirewise-deploy.b64" "$RUNNER_TEMP/chunk-"
+
+          python3 - "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$RELEASE_SHA" <<'PY'
+          import glob, json, os, sys
+
+          directory, run_id, sha = sys.argv[1:]
+          prefix = f"hirewise-deploy-{run_id}"
+          remote_b64 = f"/tmp/{prefix}.b64"
+          remote_script = f"/tmp/{prefix}.sh"
+
+          commands = [f"rm -f {remote_b64} {remote_script}"]
+          for filename in sorted(glob.glob(os.path.join(directory, "chunk-*"))):
+              with open(filename, encoding="ascii") as file:
+                  chunk = file.read()
+              commands.append(f"printf '%s' '{chunk}' >> {remote_b64}")
+
+          commands.extend([
+              f"base64 -d {remote_b64} > {remote_script}",
+              f"chmod 644 {remote_script}",
+              f"sudo -u ubuntu bash {remote_script} {sha}",
+              f"rm -f {remote_b64} {remote_script}"
+          ])
+
+          payload = {
+              "DocumentName": "AWS-RunShellScript",
+              "InstanceIds": ["i-0f66d30dc1d60be50"],
+              "Comment": f"Hirewise production deployment {sha}",
+              "TimeoutSeconds": 1800,
+              "Parameters": {"commands": commands}
+          }
+
+          with open(os.path.join(directory, "ssm-input.json"), "w") as file:
+              json.dump(payload, file)
+          PY
+
+      - name: Send deployment through SSM
+        id: deploy
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ inputs.commit_sha }}
+        run: |
+          command_id="$(aws ssm send-command \
+            --cli-input-json "file://$RUNNER_TEMP/ssm-input.json" \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          echo "SSM command ID: $command_id"
+
+          for attempt in {1..90}; do
+            status="$(aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id i-0f66d30dc1d60be50 \
+              --query 'Status' \
+              --output text 2>/dev/null || true)"
+
+            case "$status" in
+              Success)
+                aws ssm get-command-invocation \
+                  --command-id "$command_id" \
+                  --instance-id i-0f66d30dc1d60be50 \
+                  --query 'StandardOutputContent' --output text
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                aws ssm get-command-invocation \
+                  --command-id "$command_id" \
+                  --instance-id i-0f66d30dc1d60be50 \
+                  --query '{Status:Status,Error:StandardErrorContent,Output:StandardOutputContent}' \
+                  --output json
+                exit 1
+                ;;
+              *)
+                sleep 10
+                ;;
+            esac
+          done
+
+          echo "Timed out waiting for SSM deployment command." >&2
+          exit 1
 
       - name: Verify public health endpoint
         env:
